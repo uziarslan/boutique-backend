@@ -39,8 +39,8 @@ const exchangeClientCredentials = async ({ shopDomain, clientId, clientSecret })
 export const getShopifyConnectionSecrets = async () => {
   const connection = await connectionWithSecrets();
   if (!connection) throw Object.assign(new Error('Shopify is not connected.'), { statusCode: 409 });
-  const clientId = decryptShopifySecret(connection.clientIdEncrypted) || env.SHOPIFY_CLIENT_ID;
-  const clientSecret = decryptShopifySecret(connection.clientSecretEncrypted) || env.SHOPIFY_CLIENT_SECRET;
+  const clientId = decryptShopifySecret(connection.clientIdEncrypted);
+  const clientSecret = decryptShopifySecret(connection.clientSecretEncrypted);
   let accessToken = '';
   if (clientId && clientSecret) {
     accessToken = await exchangeClientCredentials({ shopDomain: connection.shopDomain, clientId, clientSecret });

@@ -91,11 +91,8 @@ export const env = {
   DISTRIBUTED_RATE_LIMIT_ENABLED: distributedRateLimitEnabled,
   RATE_LIMIT_REDIS_URL: rateLimitRedisUrl,
   SHOPIFY_API_VERSION: process.env.SHOPIFY_API_VERSION || '2026-10',
-  SHOPIFY_CLIENT_ID: process.env.SHOPIFY_CLIENT_ID || '',
-  SHOPIFY_CLIENT_SECRET: process.env.SHOPIFY_CLIENT_SECRET || '',
   SHOPIFY_EVENT_POLL_MS: Math.max(250, parseInt(process.env.SHOPIFY_EVENT_POLL_MS || '1000', 10) || 1000),
   SHOPIFY_RECONCILE_CRON: process.env.SHOPIFY_RECONCILE_CRON || '17 * * * *',
-  SHOPIFY_SHOP_DOMAIN: process.env.SHOPIFY_SHOP_DOMAIN || '',
   SHOPIFY_WEBHOOK_BASE_URL: process.env.SHOPIFY_WEBHOOK_BASE_URL || '',
   PUBLIC_RATE_LIMIT_MAX: process.env.PUBLIC_RATE_LIMIT_MAX
     ? Math.max(30, parseInt(process.env.PUBLIC_RATE_LIMIT_MAX, 10) || 120)

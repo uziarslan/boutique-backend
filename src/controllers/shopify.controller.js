@@ -24,6 +24,7 @@ import {
 const fail = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const publicConnection = (connection) => ({
   shopDomain: connection?.shopDomain || '',
+  credentialsConfigured: Boolean(connection?.clientIdEncrypted && connection?.clientSecretEncrypted),
   currency: connection?.currency || 'PKR',
   onlineOrderOutlet: connection?.onlineOrderOutlet || null,
   status: connection?.status || 'disconnected',
@@ -37,16 +38,24 @@ const publicConnection = (connection) => ({
 
 export const getShopifySettings = async (_req, res) => {
   const [connection, outlets] = await Promise.all([
-    ShopifyConnection.findOne({}).lean(),
+    ShopifyConnection.findOne({}).select('+clientIdEncrypted +clientSecretEncrypted').lean(),
     Outlet.find({ isActive: { $ne: false } }).select('_id name code').sort({ name: 1 }).lean(),
   ]);
-  res.json({ success: true, data: { connection: { ...publicConnection(connection), shopDomain: connection?.shopDomain || env.SHOPIFY_SHOP_DOMAIN }, outlets } });
+  res.json({ success: true, data: { connection: publicConnection(connection), outlets } });
 };
 
 export const connectShopify = async (req, res) => {
-  const shopDomain = normalizeShopDomain(req.body?.shopDomain || env.SHOPIFY_SHOP_DOMAIN);
-  const clientId = String(req.body?.clientId || env.SHOPIFY_CLIENT_ID || '').trim();
-  const clientSecret = String(req.body?.clientSecret || env.SHOPIFY_CLIENT_SECRET || '').trim();
+  const shopDomain = normalizeShopDomain(req.body?.shopDomain);
+  let clientId = String(req.body?.clientId || '').trim();
+  let clientSecret = String(req.body?.clientSecret || '').trim();
+  const existing = await ShopifyConnection.findOne({}).select('+clientIdEncrypted +clientSecretEncrypted').lean();
+  if (!clientId && !clientSecret && existing?.shopDomain === shopDomain) {
+    clientId = decryptShopifySecret(existing.clientIdEncrypted);
+    clientSecret = decryptShopifySecret(existing.clientSecretEncrypted);
+  }
+  if (Boolean(clientId) !== Boolean(clientSecret)) {
+    throw fail('Enter both the Shopify app client ID and client secret, or leave both blank to keep the saved credentials.');
+  }
   if (!shopDomain || !clientId || !clientSecret) {
     throw fail('Shop domain, app client ID, and app client secret are required.');
   }
