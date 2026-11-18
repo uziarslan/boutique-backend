@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>partial</TrimMode>
+    <AssemblyName>CencissPrintConnectorSetup</AssemblyName>
+    <Version>1.4.3</Version>
+    <AssemblyVersion>1.4.3.0</AssemblyVersion>
+    <FileVersion>1.4.3.0</FileVersion>
+    <Product>Cenciss Print Connector Setup</Product>
+    <Company>Cenciss</Company>
+    <Description>Installer for Cenciss Print Connector.</Description>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../app/publish/CencissPrintConnector.exe" Link="Resources/CencissPrintConnector.exe" />
+  </ItemGroup>
+  <Target Name="RejectManagedComDependency" BeforeTargets="PrepareForPublish">
+    <Error Condition="'$(BuiltInComInteropSupport)' == 'true'" Text="Cenciss setup must use native Windows tools instead of trim-incompatible managed COM." />
+  </Target>
+  <Target Name="PublishConnectorRuntime" BeforeTargets="PrepareForResources" Condition="'$(SkipConnectorRuntimePublish)' != 'true'">
+    <MSBuild
+      Projects="../app/CencissPrintConnector.csproj"
+      Targets="Publish"
+      Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;PublishDir=$(MSBuildProjectDirectory)/../app/publish/" />
+  </Target>
+</Project>
