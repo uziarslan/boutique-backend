@@ -92,7 +92,7 @@ export const connectShopify = async (req, res) => {
   }, { upsert: true, new: true, runValidators: true });
 
   try {
-    await TenantModel().updateOne({ slug: req.tenantSlug }, { $set: { shopifyDomain } });
+    await TenantModel().updateOne({ slug: req.tenantSlug }, { $set: { shopifyDomain: shopDomain } });
     const subscriptions = await ensureShopifyWebhookSubscriptions();
     connection.status = 'connected';
     connection.webhookSubscriptions = subscriptions;
