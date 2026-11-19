@@ -34,6 +34,9 @@ const retailVariantSchema = new mongoose.Schema({
   isActive: { type: Boolean, default: true },
   inventoryByLocation: { type: [locationStockSchema], default: [] },
   shopifyUpdatedAt: { type: Date, default: null },
+  // Keep the record for historical references but remove it from the working
+  // product catalog when Shopify deletes its parent product.
+  deletedAt: { type: Date, default: null },
   barcodeSyncStatus: { type: String, enum: ['synced', 'pending', 'failed'], default: 'synced' },
   barcodeSyncError: { type: String, trim: true, maxlength: 500, default: '' },
 }, { timestamps: true });

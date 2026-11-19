@@ -4,13 +4,12 @@ import SaleSession from '../models/SaleSession.js';
 import SaleTransaction from '../models/SaleTransaction.js';
 import RetailVariant from '../models/RetailVariant.js';
 import RetailInventoryMovement from '../models/RetailInventoryMovement.js';
-import StoreCredit from '../models/StoreCredit.js';
-import StoreCreditMovement from '../models/StoreCreditMovement.js';
 import Outlet from '../models/Outlet.js';
 import { getTenantConnection } from '../db/tenantContext.js';
 import { getBusinessDate } from '../utils/businessDate.js';
 import generateTransactionNumber from '../utils/transactionNumber.js';
 import { postSale } from '../accounting/journalEngine.js';
+import { enforceManualDiscountLimit } from '../utils/posDiscountLimit.js';
 import { refreshClosedSessionTotals } from './sale.controller.js';
 
 const fail = (message, statusCode = 400, code) => Object.assign(new Error(message), { statusCode, code });
@@ -29,11 +28,7 @@ const saleResult = (transaction) => ({
 
 const normalizeTender = (payload, total) => {
   const paymentMethod = String(payload.paymentMethod || 'cash');
-  if (paymentMethod === 'store-credit') {
-    if (total > 0.01) throw fail('Store credit does not cover the full amount due. Choose another payment method for the balance.', 422, 'STORE_CREDIT_PARTIAL');
-    return { paymentMethod, cashAmount: 0, cardAmount: 0, onlineTransferAmount: 0, cashTendered: 0, changeGiven: 0 };
-  }
-  if (!['cash', 'card', 'online-transfer', 'split'].includes(paymentMethod)) throw fail('Choose cash, card, online transfer, split payment, or store credit.');
+  if (!['cash', 'card', 'online-transfer', 'split'].includes(paymentMethod)) throw fail('Choose cash, card, online transfer, or split payment.');
   let cashAmount = 0;
   let cardAmount = 0;
   let onlineTransferAmount = 0;
@@ -113,6 +108,7 @@ const processSale = async ({ payload, actor, offline = false }) => {
   for (const line of merged.values()) {
     const variant = variantsById.get(line.variantId);
     if (!variant) throw fail(`Retail variant ${line.variantId} is not in the local catalog. Refresh the POS catalog and retry.`, 409, 'VARIANT_NOT_FOUND');
+    if (variant.deletedAt) throw fail(`${variant.product?.title || variant.title} was deleted from Shopify and is no longer available.`, 409, 'VARIANT_DELETED');
     if (!offline && !variant.isActive) throw fail(`${variant.product?.title || variant.title} is no longer active.`, 409, 'VARIANT_INACTIVE');
     const location = (variant.inventoryByLocation || []).find((stock) => String(stock.outlet || '') === String(outlet._id)
       && (!line.shopifyLocationId || stock.shopifyLocationId === line.shopifyLocationId));
@@ -135,17 +131,18 @@ const processSale = async ({ payload, actor, offline = false }) => {
     });
   }
   const subtotal = round2(prepared.reduce((sum, line) => sum + line.unitPrice * line.quantity, 0));
-  const discountAmount = round2(Number(payload.discountAmount || 0));
+  const discountMode = payload.discountMode === 'percent' ? 'percent' : 'amount';
+  const rawDiscount = Number(discountMode === 'percent' ? (payload.discountPercent ?? payload.discountValue ?? 0) : (payload.discountAmount || 0));
+  if (!Number.isFinite(rawDiscount) || rawDiscount < 0 || (discountMode === 'percent' && rawDiscount > 100)) {
+    throw fail('Enter a valid discount percentage or amount.', 422);
+  }
+  const discountPercent = discountMode === 'percent' ? rawDiscount : 0;
+  const discountAmount = round2(discountMode === 'percent' ? subtotal * discountPercent / 100 : rawDiscount);
   if (!Number.isFinite(discountAmount) || discountAmount < 0 || discountAmount > subtotal) throw fail('Discount must be between zero and the sale subtotal.', 422);
-  if (discountAmount > 0 && !actor.hasPermission?.('pos.discount')) throw fail('This cashier does not have permission to discount sales.', 403);
+  enforceManualDiscountLimit({ cashier: actor, subtotal, orderDiscount: discountAmount });
   const totalAmount = round2(subtotal - discountAmount);
   if (totalAmount <= 0) throw fail('The sale total must be greater than zero.', 422);
-  const storeCreditAmount = round2(Number(payload.storeCreditAmount || 0));
-  const storeCreditCode = String(payload.storeCreditCode || '').trim().toUpperCase();
-  if (!Number.isFinite(storeCreditAmount) || storeCreditAmount < 0 || storeCreditAmount > totalAmount) throw fail('Store credit amount must be between zero and the sale total.', 422);
-  if ((storeCreditAmount > 0) !== Boolean(storeCreditCode)) throw fail('Enter a store credit code and an amount to redeem it.', 422);
-  if (offline && storeCreditAmount > 0) throw fail('Store credit must be checked online before it can be redeemed.', 409, 'STORE_CREDIT_REQUIRES_ONLINE');
-  const tender = normalizeTender(payload, round2(totalAmount - storeCreditAmount));
+  const tender = normalizeTender(payload, totalAmount);
   const allocatedDiscount = prepared.map((line) => round2(discountAmount * (line.unitPrice * line.quantity) / subtotal));
   if (allocatedDiscount.length) allocatedDiscount[allocatedDiscount.length - 1] = round2(discountAmount - allocatedDiscount.slice(0, -1).reduce((sum, value) => sum + value, 0));
 
@@ -198,11 +195,10 @@ const processSale = async ({ payload, actor, offline = false }) => {
         serviceChargeAmount: 0,
         deliveryChargeAmount: 0,
         discountAmount,
-        discountMode: 'amount',
+        discountMode,
+        discountPercent,
         totalAmount,
         paymentMethod: tender.paymentMethod,
-        storeCreditCode,
-        storeCreditRedeemed: storeCreditAmount,
         cashAmount: tender.cashAmount,
         cardAmount: tender.cardAmount,
         onlineTransferAmount: tender.onlineTransferAmount,
@@ -223,27 +219,6 @@ const processSale = async ({ payload, actor, offline = false }) => {
         notes: String(payload.notes || '').slice(0, 500),
       }], { session: mongoSession });
       transaction = created;
-
-      if (storeCreditAmount > 0) {
-        const credit = await StoreCredit.findOneAndUpdate({
-          code: storeCreditCode,
-          outlet: outlet._id,
-          status: 'active',
-          balance: { $gte: storeCreditAmount },
-          $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }],
-        }, { $inc: { balance: -storeCreditAmount } }, { new: true, session: mongoSession });
-        if (!credit) throw fail('Store credit is invalid, expired, or has insufficient balance.', 409, 'STORE_CREDIT_INVALID');
-        if (credit.balance < 0.01) { credit.balance = 0; credit.status = 'redeemed'; await credit.save({ session: mongoSession }); }
-        await StoreCreditMovement.create([{
-          storeCredit: credit._id,
-          type: 'redeem',
-          amount: storeCreditAmount,
-          saleTransaction: transaction._id,
-          idempotencyKey: crypto.createHash('sha256').update(`${clientTransactionId}:credit`).digest('hex'),
-          note: `Redeemed on ${transactionNumber}`,
-          createdBy: actor.id,
-        }], { session: mongoSession });
-      }
 
       for (const [index, line] of prepared.entries()) {
         if (!line.variant.tracked || !line.location) continue;
@@ -276,7 +251,7 @@ const processSale = async ({ payload, actor, offline = false }) => {
           occurredAt: queuedAt,
         }], { session: mongoSession });
       }
-      transaction.journalEntryId = (await postSale(transaction, [], { costOfGoodsSold, storeCreditAmount, session: mongoSession }))?._id || null;
+      transaction.journalEntryId = (await postSale(transaction, [], { costOfGoodsSold, session: mongoSession }))?._id || null;
       transaction.costOfGoodsSold = costOfGoodsSold;
       transaction.costingStatus = prepared.some((line) => line.variant.unitCost == null || line.variant.unitCostStatus !== 'complete') ? 'review' : 'complete';
       await transaction.save({ session: mongoSession });

@@ -14,6 +14,9 @@ const retailProductSchema = new mongoose.Schema({
   status: { type: String, enum: ['active', 'draft', 'archived'], default: 'active' },
   shopifyUpdatedAt: { type: Date, default: null },
   isActive: { type: Boolean, default: true },
+  // Shopify deletions are hidden from live catalog views while retained for
+  // historical sale, return, inventory, and production references.
+  deletedAt: { type: Date, default: null },
 }, { timestamps: true });
 
 retailProductSchema.index({ shopifyProductId: 1 }, { unique: true, sparse: true });
