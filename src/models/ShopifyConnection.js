@@ -23,7 +23,7 @@ const shopifyConnectionSchema = new mongoose.Schema({
   webhookSubscriptions: { type: [{ topic: String, subscriptionId: String, updatedAt: Date }], default: [] },
   lastCatalogSyncAt: { type: Date, default: null },
   catalogSync: {
-    status: { type: String, enum: ['idle', 'running', 'complete', 'failed'], default: 'idle' },
+    status: { type: String, enum: ['idle', 'running', 'complete', 'failed', 'cancelled'], default: 'idle' },
     startedAt: { type: Date, default: null },
     finishedAt: { type: Date, default: null },
     productsWritten: { type: Number, default: 0 },

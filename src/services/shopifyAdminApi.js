@@ -314,7 +314,7 @@ export const fetchShopifyLocations = async () => {
   return data?.locations?.nodes || [];
 };
 
-export const importShopifyCatalog = async ({ maxPages = 100, onProgress = null } = {}) => {
+export const importShopifyCatalog = async ({ maxPages = 100, onProgress = null, shouldCancel = null } = {}) => {
   const connection = await ShopifyConnection.findOne({ status: 'connected' }).lean();
   if (!connection) throw Object.assign(new Error('Shopify is not connected.'), { statusCode: 409 });
   const mappingByLocation = new Map(
@@ -327,19 +327,27 @@ export const importShopifyCatalog = async ({ maxPages = 100, onProgress = null }
   const reportProgress = async (stage) => {
     if (typeof onProgress === 'function') await onProgress({ productsWritten, variantsWritten, pages, stage });
   };
+  const throwIfCancelled = async () => {
+    if (typeof shouldCancel === 'function' && await shouldCancel()) {
+      throw Object.assign(new Error('Shopify catalog sync cancelled.'), { code: 'SHOPIFY_TASK_CANCELLED' });
+    }
+  };
   await reportProgress('Connecting to Shopify…');
   do {
+    await throwIfCancelled();
     const { data } = await shopifyGraphql(productQuery, { after });
     const result = data?.products;
     if (!result) throw new Error('Shopify did not return a products connection.');
     await reportProgress(`Reading Shopify product page ${pages + 1}…`);
     for (const product of result.nodes || []) {
+      await throwIfCancelled();
       // Keep each GraphQL request comfortably below Shopify's 1,000-point
       // single-query ceiling. Variants are paged separately and accumulated
       // before upserting so exact-SKU matching still sees the complete set.
       const completeProduct = { ...product, variants: { ...product.variants, nodes: [...(product.variants?.nodes || [])] } };
       let variantAfter = product.variants?.pageInfo?.hasNextPage ? product.variants.pageInfo.endCursor : null;
       while (variantAfter) {
+        await throwIfCancelled();
         const { data: variantData } = await shopifyGraphql(productVariantsQuery, { id: product.id, after: variantAfter });
         const variantPage = variantData?.product?.variants;
         if (!variantPage) throw new Error(`Shopify did not return variants for product ${product.id}.`);
@@ -355,6 +363,8 @@ export const importShopifyCatalog = async ({ maxPages = 100, onProgress = null }
     await reportProgress(`Completed Shopify page ${pages}…`);
     after = result.pageInfo?.hasNextPage ? result.pageInfo.endCursor : null;
   } while (after && pages < maxPages);
+
+  await throwIfCancelled();
 
   if (after) throw new Error(`Catalog import stopped at ${maxPages} pages. Run another sync to continue.`);
   await ShopifyConnection.updateOne({}, { $set: { lastCatalogSyncAt: new Date(), lastInventorySyncAt: new Date(), lastError: '' } });

@@ -5,6 +5,7 @@ import requirePermission from '../middleware/permission.middleware.js';
 import { createManualRetailProduct } from '../controllers/retailCatalog.controller.js';
 import {
   connectShopify,
+  cancelShopifyCatalogSync,
   editRetailBarcode,
   editRetailProduct,
   getShopifyEvents,
@@ -34,6 +35,7 @@ router.post('/webhooks/register', protect, ownerOrIntegrationManager, registerSh
 router.get('/locations', protect, ownerOrIntegrationManager, getShopifyLocations);
 router.put('/mappings', protect, ownerOrIntegrationManager, saveShopifyLocationMappings);
 router.post('/catalog/sync', protect, ownerOrIntegrationManager, syncShopifyCatalog);
+router.post('/catalog/sync/cancel', protect, ownerOrIntegrationManager, cancelShopifyCatalogSync);
 router.post('/orders/reconcile', protect, ownerOrIntegrationManager, reconcileShopifyOrders);
 router.get('/events', protect, ownerOrIntegrationManager, getShopifyEvents);
 router.post('/events/:eventId/retry', protect, ownerOrIntegrationManager, retryShopifyEvent);
