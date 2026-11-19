@@ -25,6 +25,7 @@ const publicTask = (task) => ({
   _id: task._id,
   type: task.type,
   status: task.status,
+  cancelRequested: Boolean(task.cancelRequested),
   attempts: task.attempts,
   startedAt: task.startedAt,
   finishedAt: task.finishedAt,
@@ -170,6 +171,29 @@ export const syncShopifyCatalog = async (_req, res) => {
     throw error;
   }
   res.status(202).json({ success: true, data: { task: publicTask(task), message: 'Catalog sync queued.' } });
+};
+
+export const cancelShopifyCatalogSync = async (_req, res) => {
+  const task = await ShopifyTask.findOne({ type: 'catalog-sync', status: { $in: ['pending', 'processing'] } }).sort({ createdAt: -1 });
+  if (!task) throw fail('There is no active Shopify catalog sync to cancel.', 404);
+
+  const now = new Date();
+  if (task.status === 'pending') {
+    const cancelled = await ShopifyTask.findOneAndUpdate({ _id: task._id, status: 'pending' }, { $set: {
+      status: 'cancelled', finishedAt: now, leaseUntil: null, lastError: 'Cancelled by user.',
+    } }, { new: true });
+    if (cancelled) {
+      await ShopifyConnection.updateOne({}, { $set: {
+        'catalogSync.status': 'cancelled', 'catalogSync.finishedAt': now,
+        'catalogSync.stage': 'Catalog sync cancelled', 'catalogSync.error': '',
+      } });
+      return res.json({ success: true, data: { task: publicTask(cancelled), message: 'Catalog sync cancelled.' } });
+    }
+  }
+
+  const requested = await ShopifyTask.findOneAndUpdate({ _id: task._id, status: 'processing' }, { $set: { cancelRequested: true } }, { new: true });
+  if (!requested) throw fail('The Shopify catalog sync has already finished.', 409);
+  res.status(202).json({ success: true, data: { task: publicTask(requested), message: 'Cancellation requested. The sync will stop after its current Shopify request.' } });
 };
 
 export const reconcileShopifyOrders = async (req, res) => {

@@ -434,6 +434,10 @@ const processTenantShopifyTask = async (slug) => {
         if (!connection) throw new Error('Shopify is not connected.');
         const startedAt = task.payload?.startedAt || task.createdAt || now;
         result = await importShopifyCatalog({ onProgress: async (progress) => {
+          const latestTask = await ShopifyTask.findById(task._id).select('cancelRequested').lean();
+          if (latestTask?.cancelRequested) {
+            throw Object.assign(new Error('Shopify catalog sync cancelled.'), { code: 'SHOPIFY_TASK_CANCELLED' });
+          }
           await ShopifyConnection.updateOne({ _id: connection._id }, { $set: { catalogSync: {
             status: 'running', startedAt, finishedAt: null,
             productsWritten: progress.productsWritten || 0,
@@ -442,7 +446,10 @@ const processTenantShopifyTask = async (slug) => {
             stage: progress.stage || 'Importing Shopify products…',
             error: '',
           } } });
-        } });
+        }, shouldCancel: async () => Boolean(await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) });
+        if (await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) {
+          throw Object.assign(new Error('Shopify catalog sync cancelled.'), { code: 'SHOPIFY_TASK_CANCELLED' });
+        }
         await ShopifyConnection.updateOne({ _id: connection._id }, { $set: {
           catalogSync: { status: 'complete', startedAt, finishedAt: new Date(), ...result, stage: 'Catalog sync complete', error: '' },
           lastCatalogSyncAt: new Date(), lastError: '',
@@ -460,9 +467,27 @@ const processTenantShopifyTask = async (slug) => {
       } else {
         throw new Error(`Unsupported Shopify task type: ${task.type}`);
       }
-      await ShopifyTask.updateOne({ _id: task._id }, { $set: { status: 'complete', result, finishedAt: new Date(), leaseUntil: null, lastError: '' } });
+      const completed = await ShopifyTask.updateOne({ _id: task._id, status: 'processing', cancelRequested: { $ne: true } }, { $set: { status: 'complete', result, finishedAt: new Date(), leaseUntil: null, lastError: '' } });
+      if (!completed.modifiedCount && await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) {
+        throw Object.assign(new Error('Shopify catalog sync cancelled.'), { code: 'SHOPIFY_TASK_CANCELLED' });
+      }
       await ShopifyConnection.updateOne({}, { $set: { lastError: '' } });
     } catch (error) {
+      if (error.code === 'SHOPIFY_TASK_CANCELLED' || await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) {
+        const finishedAt = new Date();
+        await ShopifyTask.updateOne({ _id: task._id }, { $set: {
+          status: 'cancelled', finishedAt, leaseUntil: null, cancelRequested: false,
+          lastError: 'Cancelled by user.',
+        } });
+        if (task.type === 'catalog-sync') {
+          await ShopifyConnection.updateOne({}, { $set: {
+            'catalogSync.status': 'cancelled', 'catalogSync.finishedAt': finishedAt,
+            'catalogSync.stage': 'Catalog sync cancelled', 'catalogSync.error': '',
+          } });
+        }
+        logger.info(`[shopify:${slug}] background task ${task._id} cancelled.`);
+        return true;
+      }
       const retry = task.attempts < 5;
       const delayMs = Math.min(15 * 60_000, 30_000 * (2 ** Math.min(task.attempts - 1, 5)));
       await ShopifyTask.updateOne({ _id: task._id }, { $set: {
