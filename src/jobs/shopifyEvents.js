@@ -3,6 +3,7 @@ import cron from 'node-cron';
 import { env } from '../config/env.js';
 import { runWithTenant } from '../db/tenantContext.js';
 import ShopifyConnection from '../models/ShopifyConnection.js';
+import ShopifyTask from '../models/ShopifyTask.js';
 import ShopifyWebhookEvent from '../models/ShopifyWebhookEvent.js';
 import RetailVariant from '../models/RetailVariant.js';
 import RetailProduct from '../models/RetailProduct.js';
@@ -292,8 +293,17 @@ const processRefund = async (event) => {
 const processEvent = async (event) => {
   if (event.topic === 'products/delete') {
     const productId = gid('Product', event.resourceId);
-    const product = await RetailProduct.findOneAndUpdate({ shopifyProductId: productId }, { $set: { status: 'archived', isActive: false } });
-    if (product) await RetailVariant.updateMany({ shopifyProductId: productId }, { $set: { isActive: false } });
+    const deletedAt = new Date();
+    const product = await RetailProduct.findOneAndUpdate(
+      { shopifyProductId: productId },
+      { $set: { deletedAt, isActive: false } },
+    ).select('_id').lean();
+    if (product) {
+      await RetailVariant.updateMany(
+        { $or: [{ product: product._id }, { shopifyProductId: productId }] },
+        { $set: { deletedAt, isActive: false } },
+      );
+    }
     return;
   }
   if (event.topic === 'products/create' || event.topic === 'products/update') {
@@ -397,6 +407,76 @@ const processTenantInventoryMovement = async (slug) => {
       });
       await ShopifyConnection.updateOne({}, { $set: { lastError: String(error.message || '').slice(0, 1000) } });
       logger.warn(`[shopify:${slug}] inventory movement ${movement._id} ${final ? 'needs review' : 'will retry'}: ${error.message}`);
+    }
+    return true;
+  });
+};
+
+const processTenantShopifyTask = async (slug) => {
+  const conn = await getTenantConnectionFor(slug);
+  return runWithTenant({ conn, slug }, async () => {
+    const now = new Date();
+    const task = await ShopifyTask.findOneAndUpdate({
+      $or: [
+        { status: 'pending', availableAt: { $lte: now } },
+        { status: 'processing', leaseUntil: { $lte: now } },
+      ],
+    }, {
+      $set: { status: 'processing', leaseUntil: new Date(Date.now() + 60_000), startedAt: now, lastError: '' },
+      $inc: { attempts: 1 },
+    }, { new: true, sort: { createdAt: 1 } });
+    if (!task) return false;
+
+    try {
+      let result = {};
+      if (task.type === 'catalog-sync') {
+        const connection = await ShopifyConnection.findOne({ status: 'connected' }).lean();
+        if (!connection) throw new Error('Shopify is not connected.');
+        const startedAt = task.payload?.startedAt || task.createdAt || now;
+        result = await importShopifyCatalog({ onProgress: async (progress) => {
+          await ShopifyConnection.updateOne({ _id: connection._id }, { $set: { catalogSync: {
+            status: 'running', startedAt, finishedAt: null,
+            productsWritten: progress.productsWritten || 0,
+            variantsWritten: progress.variantsWritten || 0,
+            pages: progress.pages || 0,
+            stage: progress.stage || 'Importing Shopify products…',
+            error: '',
+          } } });
+        } });
+        await ShopifyConnection.updateOne({ _id: connection._id }, { $set: {
+          catalogSync: { status: 'complete', startedAt, finishedAt: new Date(), ...result, stage: 'Catalog sync complete', error: '' },
+          lastCatalogSyncAt: new Date(), lastError: '',
+        } });
+      } else if (task.type === 'product-update') {
+        result = await updateShopifyRetailProduct(task.payload.productId, task.payload.productInput, task.payload.variants);
+      } else if (task.type === 'barcode-update') {
+        result = await updateShopifyVariantBarcode(task.payload.variantId, task.payload.barcode);
+      } else if (task.type === 'order-reconcile') {
+        result = await reconcileTenant(slug, { lookbackDays: 60 }) || {};
+      } else if (task.type === 'webhook-register') {
+        const subscriptions = await ensureShopifyWebhookSubscriptions();
+        await ShopifyConnection.updateOne({}, { $set: { status: 'connected', webhookSubscriptions: subscriptions, lastError: '' } });
+        result = { subscriptions: subscriptions.length };
+      } else {
+        throw new Error(`Unsupported Shopify task type: ${task.type}`);
+      }
+      await ShopifyTask.updateOne({ _id: task._id }, { $set: { status: 'complete', result, finishedAt: new Date(), leaseUntil: null, lastError: '' } });
+      await ShopifyConnection.updateOne({}, { $set: { lastError: '' } });
+    } catch (error) {
+      const retry = task.attempts < 5;
+      const delayMs = Math.min(15 * 60_000, 30_000 * (2 ** Math.min(task.attempts - 1, 5)));
+      await ShopifyTask.updateOne({ _id: task._id }, { $set: {
+        status: retry ? 'pending' : 'failed',
+        availableAt: retry ? new Date(Date.now() + delayMs) : task.availableAt,
+        finishedAt: retry ? null : new Date(),
+        leaseUntil: null,
+        lastError: String(error.message || 'Shopify task failed').slice(0, 1000),
+      } });
+      if (task.type === 'catalog-sync' && !retry) {
+        await ShopifyConnection.updateOne({}, { $set: { 'catalogSync.status': 'failed', 'catalogSync.finishedAt': new Date(), 'catalogSync.stage': 'Catalog sync failed', 'catalogSync.error': String(error.message || 'Shopify catalog sync failed').slice(0, 1000) } });
+      }
+      await ShopifyConnection.updateOne({}, { $set: { lastError: String(error.message || '').slice(0, 1000) } });
+      logger.warn(`[shopify:${slug}] background task ${task._id} ${retry ? 'will retry' : 'failed'}: ${error.message}`);
     }
     return true;
   });
@@ -527,6 +607,7 @@ export const runShopifyEvents = async ({ once = false } = {}) => {
     let didWork = false;
     for (const tenant of tenants) {
       if (await processTenantEvent(tenant.slug)) didWork = true;
+      if (await processTenantShopifyTask(tenant.slug)) didWork = true;
       if (await processTenantInventoryMovement(tenant.slug)) didWork = true;
     }
     if (once) return;

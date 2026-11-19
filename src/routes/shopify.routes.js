@@ -6,10 +6,12 @@ import { createManualRetailProduct } from '../controllers/retailCatalog.controll
 import {
   connectShopify,
   editRetailBarcode,
+  editRetailProduct,
   getShopifyEvents,
   getShopifyInventoryConflicts,
   getShopifyLocations,
   getShopifySettings,
+  getRetailProduct,
   receiveShopifyWebhook,
   registerShopifyWebhooks,
   saveShopifyLocationMappings,
@@ -39,6 +41,8 @@ router.get('/inventory-conflicts', protect, ownerOrIntegrationManager, getShopif
 router.post('/inventory-conflicts/:movementId/retry', protect, ownerOrIntegrationManager, retryShopifyInventoryMovement);
 router.get('/catalog', protect, searchBoutiqueCatalog);
 router.post('/catalog/manual', protect, requirePermission('inventory.manage'), createManualRetailProduct);
+router.get('/catalog/products/:productId', protect, requirePermission('inventory.manage'), getRetailProduct);
+router.put('/catalog/products/:productId', protect, requirePermission('inventory.manage'), editRetailProduct);
 router.patch('/variants/:variantId/barcode', protect, allowRoleOrPermission(['owner', 'financeManager'], 'inventory.manage'), editRetailBarcode);
 
 export default router;

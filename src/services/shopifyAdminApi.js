@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import mongoose from 'mongoose';
 import { env } from '../config/env.js';
 import ShopifyConnection from '../models/ShopifyConnection.js';
 import RetailProduct from '../models/RetailProduct.js';
@@ -313,7 +314,7 @@ export const fetchShopifyLocations = async () => {
   return data?.locations?.nodes || [];
 };
 
-export const importShopifyCatalog = async ({ maxPages = 100 } = {}) => {
+export const importShopifyCatalog = async ({ maxPages = 100, onProgress = null } = {}) => {
   const connection = await ShopifyConnection.findOne({ status: 'connected' }).lean();
   if (!connection) throw Object.assign(new Error('Shopify is not connected.'), { statusCode: 409 });
   const mappingByLocation = new Map(
@@ -323,10 +324,15 @@ export const importShopifyCatalog = async ({ maxPages = 100 } = {}) => {
   let productsWritten = 0;
   let variantsWritten = 0;
   let pages = 0;
+  const reportProgress = async (stage) => {
+    if (typeof onProgress === 'function') await onProgress({ productsWritten, variantsWritten, pages, stage });
+  };
+  await reportProgress('Connecting to Shopify…');
   do {
     const { data } = await shopifyGraphql(productQuery, { after });
     const result = data?.products;
     if (!result) throw new Error('Shopify did not return a products connection.');
+    await reportProgress(`Reading Shopify product page ${pages + 1}…`);
     for (const product of result.nodes || []) {
       // Keep each GraphQL request comfortably below Shopify's 1,000-point
       // single-query ceiling. Variants are paged separately and accumulated
@@ -343,8 +349,10 @@ export const importShopifyCatalog = async ({ maxPages = 100 } = {}) => {
       const written = await upsertShopifyProduct(completeProduct, mappingByLocation);
       productsWritten += 1;
       variantsWritten += written.variantsWritten;
+      await reportProgress(`Imported ${product.title || 'Shopify product'}…`);
     }
     pages += 1;
+    await reportProgress(`Completed Shopify page ${pages}…`);
     after = result.pageInfo?.hasNextPage ? result.pageInfo.endCursor : null;
   } while (after && pages < maxPages);
 
@@ -414,6 +422,68 @@ export const updateShopifyVariantBarcode = async (variantId, barcode) => {
   }
 };
 
+export const updateShopifyRetailProduct = async (productId, productInput, variantInputs) => {
+  const product = await RetailProduct.findById(productId).lean();
+  if (!product) throw Object.assign(new Error('Retail product not found.'), { statusCode: 404 });
+  const variants = await RetailVariant.find({ product: product._id, shopifyVariantId: { $exists: true, $ne: '' } }).lean();
+  if (!product.shopifyProductId || variants.length !== variantInputs.length) {
+    throw Object.assign(new Error('The Shopify variant list changed. Refresh the catalog and try again.'), { statusCode: 409 });
+  }
+  const variantsById = new Map(variants.map((variant) => [String(variant._id), variant]));
+  const remoteIds = new Set(variants.map((variant) => variant.shopifyVariantId));
+  const normalizedVariants = variantInputs.map((input) => {
+    const current = variantsById.get(String(input.id));
+    if (!current || !remoteIds.has(current.shopifyVariantId)) {
+      throw Object.assign(new Error('One or more variants no longer belong to this Shopify product.'), { statusCode: 409 });
+    }
+    return { current, input };
+  });
+  const mutation = `mutation UpdateBoutiqueProduct($input: ProductUpdateInput!, $productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+    productUpdate(product: $input) {
+      product { id status }
+      userErrors { field message }
+    }
+    productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+      productVariants { id }
+      userErrors { field message }
+    }
+  }`;
+  const { data } = await shopifyGraphql(mutation, {
+    input: {
+      id: product.shopifyProductId,
+      title: productInput.title,
+      descriptionHtml: productInput.description,
+      productType: productInput.productType,
+      vendor: productInput.vendor,
+      tags: productInput.tags,
+      handle: productInput.handle,
+      status: productInput.status.toUpperCase(),
+    },
+    productId: product.shopifyProductId,
+    variants: normalizedVariants.map(({ current, input }) => ({
+      id: current.shopifyVariantId,
+      price: String(input.price),
+      compareAtPrice: input.compareAtPrice === '' || input.compareAtPrice == null ? null : String(input.compareAtPrice),
+      barcode: input.barcode || null,
+      inventoryItem: { sku: input.sku, tracked: input.tracked, cost: input.unitCost == null ? null : String(input.unitCost) },
+      inventoryPolicy: input.inventoryPolicy,
+      optionValues: (input.options || []).filter((option) => option.name && option.value)
+        .map((option) => ({ optionName: option.name, name: option.value })),
+    })),
+  });
+  const productErrors = data?.productUpdate?.userErrors || [];
+  const variantErrors = data?.productVariantsBulkUpdate?.userErrors || [];
+  if (productErrors.length || variantErrors.length || !data?.productUpdate?.product || !data?.productVariantsBulkUpdate?.productVariants) {
+    const messages = [...productErrors, ...variantErrors].map((entry) => entry.message);
+    throw Object.assign(new Error(messages.join('; ') || 'Shopify did not confirm the product update.'), { statusCode: 422 });
+  }
+  await syncShopifyProductById(product.shopifyProductId);
+  await Promise.all(normalizedVariants.map(({ current, input }) => RetailVariant.updateOne({ _id: current._id }, {
+    $set: { unitCost: input.unitCost, unitCostSource: 'manual', unitCostStatus: input.unitCost == null ? 'review' : 'complete' },
+  })));
+  return { productId: product._id, shopifyProductId: product.shopifyProductId, status: productInput.status };
+};
+
 export const adjustShopifyInventory = async ({ inventoryItemId, locationId, delta, idempotencyKey, referenceId }) => {
   const safeDelta = Number(delta);
   if (!inventoryItemId || !locationId || !Number.isInteger(safeDelta) || safeDelta === 0 || !idempotencyKey) {
@@ -422,6 +492,18 @@ export const adjustShopifyInventory = async ({ inventoryItemId, locationId, delt
   const key = /^[a-f\d]{64}$/i.test(String(idempotencyKey))
     ? String(idempotencyKey)
     : crypto.createHash('sha256').update(String(idempotencyKey)).digest('hex');
+  const currentInventoryQuery = `query BoutiqueCurrentInventory($inventoryItemId: ID!, $locationId: ID!) {
+    inventoryItem(id: $inventoryItemId) {
+      inventoryLevel(locationId: $locationId) {
+        quantities(names: ["available"]) { name quantity }
+      }
+    }
+  }`;
+  const { data: inventoryData } = await shopifyGraphql(currentInventoryQuery, { inventoryItemId, locationId });
+  const currentAvailable = Number(inventoryData?.inventoryItem?.inventoryLevel?.quantities?.find((item) => item.name === 'available')?.quantity);
+  if (!Number.isInteger(currentAvailable)) {
+    throw Object.assign(new Error('Shopify has no available inventory level for this item at the mapped location.'), { statusCode: 409, permanent: true });
+  }
   const mutation = `mutation BoutiqueInventoryAdjustment($input: InventoryAdjustQuantitiesInput!) {
     inventoryAdjustQuantities(input: $input) @idempotent(key: "${key}") {
       inventoryAdjustmentGroup { id createdAt reason referenceDocumentUri changes { name delta } }
@@ -433,39 +515,109 @@ export const adjustShopifyInventory = async ({ inventoryItemId, locationId, delt
       name: 'available',
       reason: 'correction',
       referenceDocumentUri: `boutique://inventory-movement/${encodeURIComponent(referenceId || key)}`,
-      changes: [{ inventoryItemId, locationId, delta: safeDelta }],
+      // Supply Shopify's latest quantity explicitly. API 2026-04+ requires
+      // this field, and the compare-and-swap check protects concurrent sales.
+      changes: [{ inventoryItemId, locationId, delta: safeDelta, changeFromQuantity: currentAvailable }],
     },
   });
   const result = data?.inventoryAdjustQuantities;
   if (result?.userErrors?.length || !result?.inventoryAdjustmentGroup?.id) {
-    const message = result?.userErrors?.map((entry) => entry.message).join('; ') || 'Shopify did not apply the inventory adjustment.';
-    throw Object.assign(new Error(message), { statusCode: 409, permanent: true });
+    const userErrors = result?.userErrors || [];
+    const message = userErrors.map((entry) => entry.message).join('; ') || 'Shopify did not apply the inventory adjustment.';
+    const staleQuantity = userErrors.some((entry) => /change.?from.?quantity.*stale|stale.*quantity/i.test(entry.message || ''));
+    throw Object.assign(new Error(message), { statusCode: 409, permanent: !staleQuantity });
   }
   return result.inventoryAdjustmentGroup;
 };
 
-export const searchRetailCatalog = async ({ search = '', outletId = null, limit = 100, page = 1 } = {}) => {
-  const query = { isActive: true };
+export const searchRetailCatalog = async ({ search = '', outletId = null, limit = 50, page = 1, includeInactive = false, status = 'all', source = 'all', type = '', vendor = '', tag = '', size = '', color = '', optionValue = '', stock = 'all', tracked = 'all', barcode = 'all', minPrice, maxPrice, sort = 'name', withFilterOptions = false } = {}) => {
+  const query = includeInactive ? { deletedAt: null } : { isActive: true, deletedAt: null };
+  const outletObjectId = outletId && mongoose.isValidObjectId(outletId) ? new mongoose.Types.ObjectId(outletId) : null;
+  const productFilter = { deletedAt: null };
+  if (status !== 'all') productFilter.status = status;
+  if (source !== 'all') productFilter.catalogSource = source;
+  if (type) productFilter.productType = type;
+  if (vendor) productFilter.vendor = vendor;
+  if (tag) productFilter.tags = tag;
+  if (!includeInactive) productFilter.isActive = true;
+  let filterOptions;
+  if (withFilterOptions) {
+    const [productOptionDocs, optionRows] = await Promise.all([
+      RetailProduct.find(includeInactive ? { deletedAt: null } : { isActive: true, deletedAt: null }).select('productType vendor tags').lean(),
+      RetailVariant.aggregate([
+        { $match: includeInactive ? { deletedAt: null } : { isActive: true, deletedAt: null } },
+        { $unwind: '$options' },
+        { $match: { 'options.value': { $nin: ['', 'Default Title', null] } } },
+        { $group: { _id: { name: '$options.name', value: '$options.value' } } },
+      ]),
+    ]);
+    const optionPairs = optionRows.map((row) => ({ name: row._id.name || '', value: row._id.value || '' }));
+    filterOptions = {
+      types: [...new Set(productOptionDocs.map((product) => product.productType).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+      vendors: [...new Set(productOptionDocs.map((product) => product.vendor).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+      tags: [...new Set(productOptionDocs.flatMap((product) => product.tags || []).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+      optionValues: [...new Set(optionPairs.map((option) => option.value))].sort((a, b) => a.localeCompare(b)),
+      sizes: [...new Set(optionPairs.filter((option) => /size/i.test(option.name)).map((option) => option.value))].sort((a, b) => a.localeCompare(b)),
+      colors: [...new Set(optionPairs.filter((option) => /colou?r/i.test(option.name)).map((option) => option.value))].sort((a, b) => a.localeCompare(b)),
+    };
+  }
+  if (Object.keys(productFilter).length) {
+    const productIds = await RetailProduct.find(productFilter).select('_id').lean();
+    query.product = { $in: productIds.map((item) => item._id) };
+  }
   if (search.trim()) {
     const escaped = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const regex = new RegExp(escaped, 'i');
-    const products = await RetailProduct.find({ isActive: true, $or: [{ title: regex }, { productType: regex }, { vendor: regex }] }).select('_id').limit(500).lean();
-    query.$or = [{ sku: regex }, { barcode: regex }, { title: regex }, { product: { $in: products.map((product) => product._id) } }];
+    const products = await RetailProduct.find({ ...productFilter, $or: [{ title: regex }, { productType: regex }, { vendor: regex }, { tags: regex }] }).select('_id').limit(500).lean();
+    const searchConditions = [{ sku: regex }, { barcode: regex }, { title: regex }, { 'options.value': regex }, { product: { $in: products.map((product) => product._id) } }];
+    query.$or = searchConditions;
   }
-  if (outletId) query.inventoryByLocation = { $elemMatch: { outlet: outletId } };
+  if (outletObjectId && !includeInactive) query.inventoryByLocation = { $elemMatch: { outlet: outletObjectId } };
+  if (source !== 'all') query.catalogSource = source;
+  const optionConstraints = [
+    ...(optionValue ? [{ $elemMatch: { value: optionValue } }] : []),
+    ...(size ? [{ $elemMatch: { name: /size/i, value: size } }] : []),
+    ...(color ? [{ $elemMatch: { name: /colou?r/i, value: color } }] : []),
+  ];
+  if (optionConstraints.length === 1) query.options = optionConstraints[0];
+  else if (optionConstraints.length > 1) query.options = { $all: optionConstraints };
+  if (tracked !== 'all') query.tracked = tracked === 'yes';
+  if (barcode === 'has') query.barcode = { $nin: ['', null] };
+  if (barcode === 'missing') query.barcode = { $in: ['', null] };
+  if (minPrice !== undefined && minPrice !== '' && Number.isFinite(Number(minPrice))) query.price = { ...(query.price || {}), $gte: Number(minPrice) };
+  if (maxPrice !== undefined && maxPrice !== '' && Number.isFinite(Number(maxPrice))) query.price = { ...(query.price || {}), $lte: Number(maxPrice) };
+  if (stock === 'in') {
+    query.inventoryByLocation = { $elemMatch: { ...(outletObjectId ? { outlet: outletObjectId } : {}), available: { $gt: 0 } } };
+  } else if (stock === 'out' && outletObjectId) {
+    delete query.inventoryByLocation;
+    query.$and = [...(query.$and || []), { $or: [
+      { inventoryByLocation: { $elemMatch: { outlet: outletObjectId, available: { $lte: 0 } } } },
+      { inventoryByLocation: { $not: { $elemMatch: { outlet: outletObjectId } } } },
+    ] }];
+  }
   const pageSize = Math.max(1, Math.min(250, Number(limit) || 100));
-  const pageNumber = Math.max(1, Number.parseInt(page, 10) || 1);
-  const [variants, total] = await Promise.all([RetailVariant.find(query)
-    .populate('product', 'title productType vendor imageUrl status')
-    .sort({ sku: 1, title: 1 })
+  const requestedPage = Math.max(1, Number.parseInt(page, 10) || 1);
+  const sortBy = {
+    stockAsc: { 'inventoryByLocation.available': 1, sku: 1, title: 1 },
+    stockDesc: { 'inventoryByLocation.available': -1, sku: 1, title: 1 },
+    priceAsc: { price: 1, sku: 1, title: 1 },
+    priceDesc: { price: -1, sku: 1, title: 1 },
+    name: { sku: 1, title: 1 },
+  }[sort] || { sku: 1, title: 1 };
+  const total = await RetailVariant.countDocuments(query);
+  const totalPages = Math.ceil(total / pageSize);
+  const pageNumber = totalPages ? Math.min(requestedPage, totalPages) : 1;
+  const variants = await RetailVariant.find(query)
+    .populate('product', 'title handle description productType vendor tags imageUrl status isActive')
+    .sort(sortBy)
     .skip((pageNumber - 1) * pageSize)
     .limit(pageSize)
-    .lean(), RetailVariant.countDocuments(query)]);
+    .lean();
   const items = variants.map((variant) => {
     const stock = outletId
       ? variant.inventoryByLocation.find((entry) => String(entry.outlet) === String(outletId))
       : null;
     return { ...variant, available: stock?.available ?? 0, selectedLocationId: stock?.shopifyLocationId || '' };
   });
-  return { items, total, page: pageNumber, pageSize, totalPages: Math.ceil(total / pageSize) };
+  return { items, total, page: pageNumber, pageSize, totalPages, filterOptions };
 };
