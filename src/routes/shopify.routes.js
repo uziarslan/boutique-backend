@@ -19,6 +19,7 @@ import {
   registerShopifyWebhooks,
   saveShopifyLocationMappings,
   searchBoutiqueCatalog,
+  getCatalogOptions,
   syncShopifyCatalog,
   retryShopifyEvent,
   retryShopifyInventoryMovement,
@@ -45,6 +46,7 @@ router.get('/events', protect, ownerOrIntegrationManager, getShopifyEvents);
 router.post('/events/:eventId/retry', protect, ownerOrIntegrationManager, retryShopifyEvent);
 router.get('/inventory-conflicts', protect, ownerOrIntegrationManager, getShopifyInventoryConflicts);
 router.post('/inventory-conflicts/:movementId/retry', protect, ownerOrIntegrationManager, retryShopifyInventoryMovement);
+router.get('/catalog/options', protect, getCatalogOptions);
 router.get('/catalog', protect, searchBoutiqueCatalog);
 router.post('/catalog/manual', protect, requirePermission('inventory.manage'), createManualRetailProduct);
 router.get('/catalog/products/:productId', protect, requirePermission('inventory.manage'), getRetailProduct);

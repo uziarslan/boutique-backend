@@ -16,6 +16,7 @@ import {
   fetchShopifyLocations,
   normalizeShopDomain,
   searchRetailCatalog,
+  getRetailCatalogFilterOptions,
   verifyShopifyCredentials,
 } from '../services/shopifyAdminApi.js';
 
@@ -319,6 +320,15 @@ export const retryShopifyInventoryMovement = async (req, res) => {
   res.json({ success: true, data: { _id: movement._id, syncStatus: movement.syncStatus } });
 };
 
+export const getCatalogOptions = async (req, res) => {
+  const includeInactive = req.query.includeInactive === 'true' && (req.user?.role === 'owner' || req.user?.hasPermission?.('inventory.manage'));
+  const [outlets, filterOptions] = await Promise.all([
+    Outlet.find({ isActive: { $ne: false } }).select('_id name code').sort({ name: 1 }).lean(),
+    getRetailCatalogFilterOptions({ includeInactive }),
+  ]);
+  res.json({ success: true, data: { outlets, filterOptions } });
+};
+
 export const searchBoutiqueCatalog = async (req, res) => {
   const limit = Math.min(250, Math.max(1, Number(req.query.limit) || 50));
   const canViewInactive = req.user?.role === 'owner' || req.user?.hasPermission?.('inventory.manage');
@@ -343,6 +353,7 @@ export const searchBoutiqueCatalog = async (req, res) => {
     barcode: ['has', 'missing'].includes(req.query.barcode) ? req.query.barcode : 'all',
     minPrice: req.query.minPrice, maxPrice: req.query.maxPrice, sort: String(req.query.sort || 'name'),
     withFilterOptions: req.query.withFilterOptions === 'true',
+    summary: req.query.summary === 'true',
   });
   res.json({ success: true, data: catalog });
 };

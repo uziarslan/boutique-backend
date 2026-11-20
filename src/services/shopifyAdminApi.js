@@ -546,7 +546,28 @@ export const adjustShopifyInventory = async ({ inventoryItemId, locationId, delt
   return result.inventoryAdjustmentGroup;
 };
 
-export const searchRetailCatalog = async ({ search = '', outletId = null, limit = 50, page = 1, includeInactive = false, status = 'all', source = 'all', type = '', vendor = '', tag = '', size = '', color = '', optionValue = '', stock = 'all', tracked = 'all', barcode = 'all', minPrice, maxPrice, sort = 'name', withFilterOptions = false } = {}) => {
+export const getRetailCatalogFilterOptions = async ({ includeInactive = false } = {}) => {
+  const [productOptionDocs, optionRows] = await Promise.all([
+    RetailProduct.find(includeInactive ? { deletedAt: null } : { isActive: true, deletedAt: null }).select('productType vendor tags').lean(),
+    RetailVariant.aggregate([
+      { $match: includeInactive ? { deletedAt: null } : { isActive: true, deletedAt: null } },
+      { $unwind: '$options' },
+      { $match: { 'options.value': { $nin: ['', 'Default Title', null] } } },
+      { $group: { _id: { name: '$options.name', value: '$options.value' } } },
+    ]),
+  ]);
+  const optionPairs = optionRows.map((row) => ({ name: row._id.name || '', value: row._id.value || '' }));
+  return {
+    types: [...new Set(productOptionDocs.map((product) => product.productType).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    vendors: [...new Set(productOptionDocs.map((product) => product.vendor).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    tags: [...new Set(productOptionDocs.flatMap((product) => product.tags || []).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    optionValues: [...new Set(optionPairs.map((option) => option.value))].sort((a, b) => a.localeCompare(b)),
+    sizes: [...new Set(optionPairs.filter((option) => /size/i.test(option.name)).map((option) => option.value))].sort((a, b) => a.localeCompare(b)),
+    colors: [...new Set(optionPairs.filter((option) => /colou?r/i.test(option.name)).map((option) => option.value))].sort((a, b) => a.localeCompare(b)),
+  };
+};
+
+export const searchRetailCatalog = async ({ search = '', outletId = null, limit = 50, page = 1, includeInactive = false, status = 'all', source = 'all', type = '', vendor = '', tag = '', size = '', color = '', optionValue = '', stock = 'all', tracked = 'all', barcode = 'all', minPrice, maxPrice, sort = 'name', withFilterOptions = false, summary = false } = {}) => {
   const query = includeInactive ? { deletedAt: null } : { isActive: true, deletedAt: null };
   const outletObjectId = outletId && mongoose.isValidObjectId(outletId) ? new mongoose.Types.ObjectId(outletId) : null;
   const productFilter = { deletedAt: null };
@@ -556,38 +577,6 @@ export const searchRetailCatalog = async ({ search = '', outletId = null, limit 
   if (vendor) productFilter.vendor = vendor;
   if (tag) productFilter.tags = tag;
   if (!includeInactive) productFilter.isActive = true;
-  let filterOptions;
-  if (withFilterOptions) {
-    const [productOptionDocs, optionRows] = await Promise.all([
-      RetailProduct.find(includeInactive ? { deletedAt: null } : { isActive: true, deletedAt: null }).select('productType vendor tags').lean(),
-      RetailVariant.aggregate([
-        { $match: includeInactive ? { deletedAt: null } : { isActive: true, deletedAt: null } },
-        { $unwind: '$options' },
-        { $match: { 'options.value': { $nin: ['', 'Default Title', null] } } },
-        { $group: { _id: { name: '$options.name', value: '$options.value' } } },
-      ]),
-    ]);
-    const optionPairs = optionRows.map((row) => ({ name: row._id.name || '', value: row._id.value || '' }));
-    filterOptions = {
-      types: [...new Set(productOptionDocs.map((product) => product.productType).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
-      vendors: [...new Set(productOptionDocs.map((product) => product.vendor).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
-      tags: [...new Set(productOptionDocs.flatMap((product) => product.tags || []).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
-      optionValues: [...new Set(optionPairs.map((option) => option.value))].sort((a, b) => a.localeCompare(b)),
-      sizes: [...new Set(optionPairs.filter((option) => /size/i.test(option.name)).map((option) => option.value))].sort((a, b) => a.localeCompare(b)),
-      colors: [...new Set(optionPairs.filter((option) => /colou?r/i.test(option.name)).map((option) => option.value))].sort((a, b) => a.localeCompare(b)),
-    };
-  }
-  if (Object.keys(productFilter).length) {
-    const productIds = await RetailProduct.find(productFilter).select('_id').lean();
-    query.product = { $in: productIds.map((item) => item._id) };
-  }
-  if (search.trim()) {
-    const escaped = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(escaped, 'i');
-    const products = await RetailProduct.find({ ...productFilter, $or: [{ title: regex }, { productType: regex }, { vendor: regex }, { tags: regex }] }).select('_id').limit(500).lean();
-    const searchConditions = [{ sku: regex }, { barcode: regex }, { title: regex }, { 'options.value': regex }, { product: { $in: products.map((product) => product._id) } }];
-    query.$or = searchConditions;
-  }
   if (outletObjectId && !includeInactive) query.inventoryByLocation = { $elemMatch: { outlet: outletObjectId } };
   if (source !== 'all') query.catalogSource = source;
   const optionConstraints = [
@@ -602,38 +591,55 @@ export const searchRetailCatalog = async ({ search = '', outletId = null, limit 
   if (barcode === 'missing') query.barcode = { $in: ['', null] };
   if (minPrice !== undefined && minPrice !== '' && Number.isFinite(Number(minPrice))) query.price = { ...(query.price || {}), $gte: Number(minPrice) };
   if (maxPrice !== undefined && maxPrice !== '' && Number.isFinite(Number(maxPrice))) query.price = { ...(query.price || {}), $lte: Number(maxPrice) };
-  if (stock === 'in') {
-    query.inventoryByLocation = { $elemMatch: { ...(outletObjectId ? { outlet: outletObjectId } : {}), available: { $gt: 0 } } };
-  } else if (stock === 'out' && outletObjectId) {
-    delete query.inventoryByLocation;
-    query.$and = [...(query.$and || []), { $or: [
-      { inventoryByLocation: { $elemMatch: { outlet: outletObjectId, available: { $lte: 0 } } } },
-      { inventoryByLocation: { $not: { $elemMatch: { outlet: outletObjectId } } } },
-    ] }];
+  // Keep filtering, joining, counting and paging inside MongoDB in one trip.
+  const pipeline = [{ $match: query }, {
+    $lookup: {
+      from: RetailProduct.collection.name, localField: 'product', foreignField: '_id', as: 'product',
+      pipeline: [{ $match: productFilter }, { $project: {
+        title: 1, handle: 1, ...(summary ? {} : { description: 1 }), productType: 1, vendor: 1,
+        tags: 1, imageUrl: 1, status: 1, isActive: 1,
+      } }],
+    },
+  }, { $unwind: '$product' }];
+  if (search.trim()) {
+    const regex = new RegExp(search.trim().slice(0, 200).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    pipeline.push({ $match: { $or: ['sku', 'barcode', 'title', 'options.value', 'product.title', 'product.productType', 'product.vendor', 'product.tags'].map((field) => ({ [field]: regex })) } });
   }
-  const pageSize = Math.max(1, Math.min(250, Number(limit) || 100));
+  const locations = { $ifNull: ['$inventoryByLocation', []] };
+  const selectedLocations = { $filter: { input: locations, as: 'location', cond: { $eq: ['$$location.outlet', outletObjectId] } } };
+  // Preserve the selected stock location used by POS inventory movements.
+  const firstLocationValue = (field, fallback) => ({ $ifNull: [{ $arrayElemAt: [{ $map: {
+    input: selectedLocations, as: 'location', in: `$$location.${field}`,
+  } }, 0] }, fallback] });
+  pipeline.push({ $set: {
+    available: outletObjectId ? firstLocationValue('available', 0)
+      : { $sum: { $map: { input: locations, as: 'location', in: '$$location.available' } } },
+    selectedLocationId: firstLocationValue('shopifyLocationId', ''),
+  } });
+  if (stock === 'in') pipeline.push({ $match: { available: { $gt: 0 } } });
+  if (stock === 'out') pipeline.push({ $match: { available: { $lte: 0 } } });
+  const pageSize = Math.max(1, Math.min(250, Math.floor(Number(limit) || 50)));
   const requestedPage = Math.max(1, Number.parseInt(page, 10) || 1);
   const sortBy = {
-    stockAsc: { 'inventoryByLocation.available': 1, sku: 1, title: 1 },
-    stockDesc: { 'inventoryByLocation.available': -1, sku: 1, title: 1 },
-    priceAsc: { price: 1, sku: 1, title: 1 },
-    priceDesc: { price: -1, sku: 1, title: 1 },
-    name: { sku: 1, title: 1 },
-  }[sort] || { sku: 1, title: 1 };
-  const total = await RetailVariant.countDocuments(query);
+    stockAsc: { available: 1, 'product.title': 1, _id: 1 },
+    stockDesc: { available: -1, 'product.title': 1, _id: 1 },
+    priceAsc: { price: 1, 'product.title': 1, _id: 1 },
+    priceDesc: { price: -1, 'product.title': 1, _id: 1 },
+    name: { 'product.title': 1, title: 1, _id: 1 },
+  }[sort] || { 'product.title': 1, title: 1, _id: 1 };
+  const rows = (pageNumber) => [
+    { $sort: sortBy }, { $skip: (pageNumber - 1) * pageSize }, { $limit: pageSize },
+    ...(summary ? [{ $project: { _id: 1, product: 1, title: 1, options: 1, sku: 1, barcode: 1, price: 1, available: 1, tracked: 1, catalogSource: 1, shopifyVariantId: 1, selectedLocationId: 1 } }] : []),
+  ];
+  const [result, filterOptions] = await Promise.all([
+    RetailVariant.aggregate([...pipeline, { $facet: { items: rows(requestedPage), totals: [{ $count: 'count' }] } }]).collation({ locale: 'en', strength: 2 }),
+    withFilterOptions ? getRetailCatalogFilterOptions({ includeInactive }) : undefined,
+  ]);
+  const total = result[0]?.totals[0]?.count || 0;
   const totalPages = Math.ceil(total / pageSize);
   const pageNumber = totalPages ? Math.min(requestedPage, totalPages) : 1;
-  const variants = await RetailVariant.find(query)
-    .populate('product', 'title handle description productType vendor tags imageUrl status isActive')
-    .sort(sortBy)
-    .skip((pageNumber - 1) * pageSize)
-    .limit(pageSize)
-    .lean();
-  const items = variants.map((variant) => {
-    const stock = outletId
-      ? variant.inventoryByLocation.find((entry) => String(entry.outlet) === String(outletId))
-      : null;
-    return { ...variant, available: stock?.available ?? 0, selectedLocationId: stock?.shopifyLocationId || '' };
-  });
+  const items = pageNumber !== requestedPage && total
+    ? await RetailVariant.aggregate([...pipeline, ...rows(pageNumber)]).collation({ locale: 'en', strength: 2 })
+    : result[0]?.items || [];
   return { items, total, page: pageNumber, pageSize, totalPages, filterOptions };
 };
