@@ -5,6 +5,8 @@ import requirePermission from '../middleware/permission.middleware.js';
 import { createManualRetailProduct } from '../controllers/retailCatalog.controller.js';
 import {
   connectShopify,
+  retryShopifyTask,
+  cancelShopifyTask,
   cancelShopifyCatalogSync,
   editRetailBarcode,
   editRetailProduct,
@@ -29,6 +31,8 @@ shopifyWebhookRouter.post('/', receiveShopifyWebhook);
 const router = Router();
 const ownerOrIntegrationManager = allowRoleOrPermission(['owner', 'financeManager'], 'settings.integrations');
 
+router.post('/tasks/:taskId/retry', protect, ownerOrIntegrationManager, retryShopifyTask);
+router.post('/tasks/:taskId/cancel', protect, ownerOrIntegrationManager, cancelShopifyTask);
 router.get('/settings', protect, ownerOrIntegrationManager, getShopifySettings);
 router.post('/connect', protect, ownerOrIntegrationManager, connectShopify);
 router.post('/webhooks/register', protect, ownerOrIntegrationManager, registerShopifyWebhooks);

@@ -8,7 +8,7 @@ import { runShopifyEvents } from './shopifyEvents.js';
 const main = async () => {
   try {
     await connectDB();
-    logger.info('[jobs:shopify-events] worker started.');
+    logger.info(`[jobs:shopify-events] queue-v2 worker started; release=${process.env.HEROKU_SLUG_COMMIT || 'local'}.`);
     await runShopifyEvents();
   } catch (error) {
     logger.error(`[jobs:shopify-events] worker stopped: ${error.stack || error.message}`);

@@ -1,3 +1,5 @@
+import ShopifyWorkerLease from '../models/ShopifyWorkerLease.js';
+import { withShopifyTask } from '../services/shopifyTaskContext.js';
 import crypto from 'crypto';
 import cron from 'node-cron';
 import { env } from '../config/env.js';
@@ -16,6 +18,7 @@ import { TenantModel } from '../platform/models/Tenant.js';
 import { getTenantConnectionFor } from '../db/connections.js';
 import { getBusinessDate } from '../utils/businessDate.js';
 import {
+  ensureShopifyWebhookSubscriptions,
   adjustShopifyInventory,
   importShopifyCatalog,
   shopifyGraphql,
@@ -419,70 +422,104 @@ const processTenantInventoryMovement = async (slug) => {
   });
 };
 
-const processTenantShopifyTask = async (slug) => {
+export const processTenantShopifyTask = async (slug) => {
   const conn = await getTenantConnectionFor(slug);
   return runWithTenant({ conn, slug }, async () => {
     const now = new Date();
+    // Older workers requeued errors indefinitely from the user's perspective.
+    const stoppedCatalog = await ShopifyTask.exists({ type: 'catalog-sync', status: 'pending', lastError: { $nin: ['', null] } });
+    await ShopifyTask.updateMany({ status: 'pending', lastError: { $nin: ['', null] } }, { $set: {
+      status: 'cancelled', finishedAt: now, leaseUntil: null, cancelRequested: false,
+    } });
+    if (stoppedCatalog) await ShopifyConnection.updateOne({}, { $set: {
+      'catalogSync.status': 'failed', 'catalogSync.finishedAt': now,
+      'catalogSync.stage': 'Sync stopped. Review the task error and retry.',
+    } });
+    const leaseToken = crypto.randomUUID();
     const task = await ShopifyTask.findOneAndUpdate({
       $or: [
         { status: 'pending', availableAt: { $lte: now } },
         { status: 'processing', leaseUntil: { $lte: now } },
       ],
     }, {
-      $set: { status: 'processing', leaseUntil: new Date(Date.now() + 60_000), startedAt: now, lastError: '' },
+      $set: { status: 'processing', leaseToken, workerVersion: process.env.HEROKU_SLUG_COMMIT || 'local-queue-v2', leaseUntil: new Date(Date.now() + 60_000), startedAt: now, lastError: '' },
       $inc: { attempts: 1 },
     }, { new: true, sort: { createdAt: 1 } });
     if (!task) return false;
-
+    const owned = { _id: task._id, leaseToken, status: 'processing' };
+    let leaseLost = false;
+    const check = async () => {
+      const current = await ShopifyTask.findOne(owned).select('cancelRequested').lean();
+      if (leaseLost || !current) throw Object.assign(new Error('Worker lease lost.'), { code: 'SHOPIFY_LEASE_LOST' });
+      if (current.cancelRequested) throw Object.assign(new Error('Cancelled by user.'), { code: 'SHOPIFY_TASK_CANCELLED' });
+    };
+    const heartbeat = setInterval(() => {
+      ShopifyTask.updateOne(owned, { $set: { leaseUntil: new Date(Date.now() + 60_000) } })
+        .then((result) => { if (!result.matchedCount) leaseLost = true; })
+        .catch(() => { leaseLost = true; });
+    }, 15000);
+    heartbeat.unref();
     try {
-      let result = {};
-      if (task.type === 'catalog-sync') {
-        const connection = await ShopifyConnection.findOne({ status: 'connected' }).lean();
-        if (!connection) throw new Error('Shopify is not connected.');
-        const startedAt = task.payload?.startedAt || task.createdAt || now;
-        result = await importShopifyCatalog({ onProgress: async (progress) => {
+      await withShopifyTask(check, async () => {
+        await check();
+        let result = {};
+        if (task.type === 'catalog-sync') {
+          const connection = await ShopifyConnection.findOne({ status: 'connected' }).lean();
+          if (!connection) throw new Error('Shopify is not connected.');
+          const startedAt = task.payload?.startedAt || task.createdAt || now;
+          result = await importShopifyCatalog({ onProgress: async (progress) => {
+            await check();
           const latestTask = await ShopifyTask.findById(task._id).select('cancelRequested').lean();
-          if (latestTask?.cancelRequested) {
+            if (latestTask?.cancelRequested) {
+              throw Object.assign(new Error('Shopify catalog sync cancelled.'), { code: 'SHOPIFY_TASK_CANCELLED' });
+            }
+            await ShopifyConnection.updateOne({ _id: connection._id }, { $set: { catalogSync: {
+              status: 'running', startedAt, finishedAt: null,
+              productsWritten: progress.productsWritten || 0,
+              variantsWritten: progress.variantsWritten || 0,
+              pages: progress.pages || 0,
+              stage: progress.stage || 'Importing Shopify products…',
+              error: '',
+            } } });
+          }, shouldCancel: async () => Boolean(await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) });
+          if (await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) {
             throw Object.assign(new Error('Shopify catalog sync cancelled.'), { code: 'SHOPIFY_TASK_CANCELLED' });
           }
-          await ShopifyConnection.updateOne({ _id: connection._id }, { $set: { catalogSync: {
-            status: 'running', startedAt, finishedAt: null,
-            productsWritten: progress.productsWritten || 0,
-            variantsWritten: progress.variantsWritten || 0,
-            pages: progress.pages || 0,
-            stage: progress.stage || 'Importing Shopify products…',
-            error: '',
-          } } });
-        }, shouldCancel: async () => Boolean(await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) });
-        if (await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) {
+          await ShopifyConnection.updateOne({ _id: connection._id }, { $set: {
+            catalogSync: { status: 'complete', startedAt, finishedAt: new Date(), ...result, stage: 'Catalog sync complete', error: '' },
+            lastCatalogSyncAt: new Date(), lastError: '',
+          } });
+        } else if (task.type === 'product-update') {
+          if (await ShopifyTask.exists({ type: 'product-update', 'payload.productId': task.payload.productId, createdAt: { $gt: task.createdAt } })) {
+            throw new Error('A newer product edit exists. This older update was stopped to protect the latest changes.');
+          }
+          result = await updateShopifyRetailProduct(task.payload.productId, task.payload.productInput, task.payload.variants);
+        } else if (task.type === 'barcode-update') {
+          if (await ShopifyTask.exists({ type: 'barcode-update', 'payload.variantId': task.payload.variantId, createdAt: { $gt: task.createdAt } })) {
+            throw new Error('A newer barcode edit exists. This older update was stopped to protect the latest changes.');
+          }
+          result = await updateShopifyVariantBarcode(task.payload.variantId, task.payload.barcode);
+        } else if (task.type === 'order-reconcile') {
+          result = await reconcileTenant(slug, { lookbackDays: task.payload?.scheduled ? 0 : 60 }) || {};
+        } else if (task.type === 'webhook-register') {
+          const subscriptions = await ensureShopifyWebhookSubscriptions();
+          await ShopifyConnection.updateOne({}, { $set: { status: 'connected', webhookSubscriptions: subscriptions, lastError: '' } });
+          result = { subscriptions: subscriptions.length };
+        } else {
+          throw new Error(`Unsupported Shopify task type: ${task.type}`);
+        }
+        await check();
+        const completed = await ShopifyTask.updateOne({ ...owned, cancelRequested: { $ne: true } }, { $set: { status: 'complete', result, finishedAt: new Date(), leaseUntil: null, lastError: '' } });
+        if (!completed.modifiedCount && await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) {
           throw Object.assign(new Error('Shopify catalog sync cancelled.'), { code: 'SHOPIFY_TASK_CANCELLED' });
         }
-        await ShopifyConnection.updateOne({ _id: connection._id }, { $set: {
-          catalogSync: { status: 'complete', startedAt, finishedAt: new Date(), ...result, stage: 'Catalog sync complete', error: '' },
-          lastCatalogSyncAt: new Date(), lastError: '',
-        } });
-      } else if (task.type === 'product-update') {
-        result = await updateShopifyRetailProduct(task.payload.productId, task.payload.productInput, task.payload.variants);
-      } else if (task.type === 'barcode-update') {
-        result = await updateShopifyVariantBarcode(task.payload.variantId, task.payload.barcode);
-      } else if (task.type === 'order-reconcile') {
-        result = await reconcileTenant(slug, { lookbackDays: 60 }) || {};
-      } else if (task.type === 'webhook-register') {
-        const subscriptions = await ensureShopifyWebhookSubscriptions();
-        await ShopifyConnection.updateOne({}, { $set: { status: 'connected', webhookSubscriptions: subscriptions, lastError: '' } });
-        result = { subscriptions: subscriptions.length };
-      } else {
-        throw new Error(`Unsupported Shopify task type: ${task.type}`);
-      }
-      const completed = await ShopifyTask.updateOne({ _id: task._id, status: 'processing', cancelRequested: { $ne: true } }, { $set: { status: 'complete', result, finishedAt: new Date(), leaseUntil: null, lastError: '' } });
-      if (!completed.modifiedCount && await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) {
-        throw Object.assign(new Error('Shopify catalog sync cancelled.'), { code: 'SHOPIFY_TASK_CANCELLED' });
-      }
-      await ShopifyConnection.updateOne({}, { $set: { lastError: '' } });
+        await ShopifyConnection.updateOne({}, { $set: { lastError: '' } });
+      });
     } catch (error) {
+      if (error.code === 'SHOPIFY_LEASE_LOST') return true;
       if (error.code === 'SHOPIFY_TASK_CANCELLED' || await ShopifyTask.exists({ _id: task._id, cancelRequested: true })) {
         const finishedAt = new Date();
-        await ShopifyTask.updateOne({ _id: task._id }, { $set: {
+        await ShopifyTask.updateOne(owned, { $set: {
           status: 'cancelled', finishedAt, leaseUntil: null, cancelRequested: false,
           lastError: 'Cancelled by user.',
         } });
@@ -495,20 +532,19 @@ const processTenantShopifyTask = async (slug) => {
         logger.info(`[shopify:${slug}] background task ${task._id} cancelled.`);
         return true;
       }
-      const retry = task.attempts < 5;
-      const delayMs = Math.min(15 * 60_000, 30_000 * (2 ** Math.min(task.attempts - 1, 5)));
-      await ShopifyTask.updateOne({ _id: task._id }, { $set: {
-        status: retry ? 'pending' : 'failed',
-        availableAt: retry ? new Date(Date.now() + delayMs) : task.availableAt,
-        finishedAt: retry ? null : new Date(),
+      await ShopifyTask.updateOne(owned, { $set: {
+        status: 'cancelled',
+        finishedAt: new Date(),
         leaseUntil: null,
         lastError: String(error.message || 'Shopify task failed').slice(0, 1000),
       } });
-      if (task.type === 'catalog-sync' && !retry) {
+      if (task.type === 'catalog-sync') {
         await ShopifyConnection.updateOne({}, { $set: { 'catalogSync.status': 'failed', 'catalogSync.finishedAt': new Date(), 'catalogSync.stage': 'Catalog sync failed', 'catalogSync.error': String(error.message || 'Shopify catalog sync failed').slice(0, 1000) } });
       }
       await ShopifyConnection.updateOne({}, { $set: { lastError: String(error.message || '').slice(0, 1000) } });
-      logger.warn(`[shopify:${slug}] background task ${task._id} ${retry ? 'will retry' : 'failed'}: ${error.message}`);
+      logger.warn(`[shopify:${slug}] background task ${task._id} stopped: ${error.message}`);
+    } finally {
+      clearInterval(heartbeat);
     }
     return true;
   });
@@ -617,32 +653,79 @@ export const reconcileTenant = async (slug, { lookbackDays = 0 } = {}) => {
   });
 };
 
+// One current worker owns a tenant at a time, including webhooks and stock writes.
+const withTenantWorkerLease = async (slug, work) => {
+  const conn = await getTenantConnectionFor(slug);
+  return runWithTenant({ conn, slug }, async () => {
+    const owner = crypto.randomUUID();
+    try {
+      const lease = await ShopifyWorkerLease.findOneAndUpdate({ _id: 'shopify', expiresAt: { $lte: new Date() } }, {
+        $set: { owner, expiresAt: new Date(Date.now() + 90000) },
+      }, { new: true, upsert: true });
+      if (!lease) return false;
+    } catch (error) {
+      if (error.code === 11000) return false;
+      throw error;
+    }
+    let lost = false;
+    const renew = setInterval(() => {
+      ShopifyWorkerLease.updateOne({ _id: 'shopify', owner }, { $set: { expiresAt: new Date(Date.now() + 90000) } })
+        .then((result) => { if (!result.matchedCount) lost = true; }).catch(() => { lost = true; });
+    }, 20000);
+    renew.unref();
+    try {
+      return await withShopifyTask(async () => {
+        if (lost) throw Object.assign(new Error('Shopify worker lease lost; processing stopped.'), { code: 'SHOPIFY_LEASE_LOST' });
+      }, work);
+    } finally {
+      clearInterval(renew);
+      await ShopifyWorkerLease.deleteOne({ _id: 'shopify', owner });
+    }
+  });
+};
+
 export const runShopifyEvents = async ({ once = false } = {}) => {
   let shuttingDown = false;
   const stop = () => { shuttingDown = true; };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
-  if (cron.validate(env.SHOPIFY_RECONCILE_CRON)) {
-    cron.schedule(env.SHOPIFY_RECONCILE_CRON, async () => {
-      const tenants = await TenantModel().find({ shopifyDomain: { $type: 'string' } }).select('slug').lean();
-      for (const tenant of tenants) {
-        try { await reconcileTenant(tenant.slug); }
-        catch (error) { logger.error(`[shopify:${tenant.slug}] reconciliation failed: ${error.message}`); }
-      }
+  let schedule;
+  if (!once && cron.validate(env.SHOPIFY_RECONCILE_CRON)) {
+    schedule = cron.schedule(env.SHOPIFY_RECONCILE_CRON, async () => {
+      try {
+        const tenants = await TenantModel().find({ shopifyDomain: { $type: 'string' } }).select('slug').lean();
+        for (const tenant of tenants) await withTenantWorkerLease(tenant.slug, async () => {
+          if (!await ShopifyTask.exists({ type: 'order-reconcile', status: { $in: ['pending', 'processing'] } })) {
+            await ShopifyTask.create({ type: 'order-reconcile', payload: { scheduled: true }, status: 'pending' });
+          }
+        });
+      } catch (error) { logger.error(`[shopify] Scheduled reconciliation failed: ${error.message}`); }
     });
-  } else {
-    logger.error(`[shopify] Invalid SHOPIFY_RECONCILE_CRON value: ${env.SHOPIFY_RECONCILE_CRON}`);
   }
   const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  while (!shuttingDown) {
-    const tenants = await TenantModel().find({ shopifyDomain: { $type: 'string' } }).select('slug').lean();
-    let didWork = false;
-    for (const tenant of tenants) {
-      if (await processTenantEvent(tenant.slug)) didWork = true;
-      if (await processTenantShopifyTask(tenant.slug)) didWork = true;
-      if (await processTenantInventoryMovement(tenant.slug)) didWork = true;
+  try {
+    while (!shuttingDown) {
+      let didWork = false;
+      try {
+        const tenants = await TenantModel().find({ shopifyDomain: { $type: 'string' } }).select('slug').lean();
+        for (const tenant of tenants) {
+          if (shuttingDown) break;
+          try {
+            if (await withTenantWorkerLease(tenant.slug, async () => {
+              let worked = await processTenantEvent(tenant.slug);
+              worked = await processTenantShopifyTask(tenant.slug) || worked;
+              worked = await processTenantInventoryMovement(tenant.slug) || worked;
+              return worked;
+            })) didWork = true;
+          } catch (error) { logger.error(`[shopify:${tenant.slug}] Worker cycle failed: ${error.message}`); }
+        }
+      } catch (error) { logger.error(`[shopify] Tenant lookup failed: ${error.message}`); }
+      if (once) return;
+      if (!didWork) await pause(env.SHOPIFY_EVENT_POLL_MS);
     }
-    if (once) return;
-    if (!didWork) await pause(env.SHOPIFY_EVENT_POLL_MS);
+  } finally {
+    schedule?.stop();
+    process.removeListener('SIGINT', stop);
+    process.removeListener('SIGTERM', stop);
   }
-}
+};
