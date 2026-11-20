@@ -15,7 +15,14 @@ import Outlet from '../models/Outlet.js';
 import { TenantModel } from '../platform/models/Tenant.js';
 import { getTenantConnectionFor } from '../db/connections.js';
 import { getBusinessDate } from '../utils/businessDate.js';
-import { adjustShopifyInventory, importShopifyCatalog, shopifyGraphql, syncShopifyProductById } from '../services/shopifyAdminApi.js';
+import {
+  adjustShopifyInventory,
+  importShopifyCatalog,
+  shopifyGraphql,
+  syncShopifyProductById,
+  updateShopifyRetailProduct,
+  updateShopifyVariantBarcode,
+} from '../services/shopifyAdminApi.js';
 import { postSale, postShopifyRefund } from '../accounting/journalEngine.js';
 import logger from '../utils/logger.js';
 
