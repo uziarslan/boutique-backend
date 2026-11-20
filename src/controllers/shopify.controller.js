@@ -27,6 +27,8 @@ const publicTask = (task) => ({
   status: task.status,
   cancelRequested: Boolean(task.cancelRequested),
   attempts: task.attempts,
+  workerVersion: task.workerVersion || '',
+  availableAt: task.availableAt,
   startedAt: task.startedAt,
   finishedAt: task.finishedAt,
   lastError: task.lastError || '',
@@ -156,10 +158,11 @@ export const syncShopifyCatalog = async (_req, res) => {
   if (!connection) throw fail('Shopify is not connected.', 409);
   if (connection.catalogSync?.status === 'running') throw fail('A catalog sync is already running. Check the progress below.', 409);
   const startedAt = new Date();
-  await ShopifyConnection.updateOne({ _id: connection._id }, { $set: {
+  const claimed = await ShopifyConnection.updateOne({ _id: connection._id, 'catalogSync.status': { $ne: 'running' } }, { $set: {
     catalogSync: { status: 'running', startedAt, finishedAt: null, productsWritten: 0, variantsWritten: 0, pages: 0, stage: 'Connecting to Shopify…', error: '' },
     lastError: '',
   } });
+  if (!claimed.modifiedCount) throw fail('A catalog sync is already queued or running.', 409);
   let task;
   try {
     task = await enqueueShopifyTask('catalog-sync', { startedAt });
@@ -194,6 +197,49 @@ export const cancelShopifyCatalogSync = async (_req, res) => {
   const requested = await ShopifyTask.findOneAndUpdate({ _id: task._id, status: 'processing' }, { $set: { cancelRequested: true } }, { new: true });
   if (!requested) throw fail('The Shopify catalog sync has already finished.', 409);
   res.status(202).json({ success: true, data: { task: publicTask(requested), message: 'Cancellation requested. The sync will stop after its current Shopify request.' } });
+};
+
+// Task IDs are resolved through the authenticated tenant's model connection.
+export const retryShopifyTask = async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.taskId)) throw fail('Invalid task ID.');
+  const task = await ShopifyTask.findById(req.params.taskId).lean();
+  if (!task) throw fail('Shopify task not found.', 404);
+  if (!['failed', 'cancelled'].includes(task.status) && !(task.status === 'pending' && task.lastError)) {
+    throw fail('Only stopped tasks can be retried.', 409);
+  }
+  if (!await ShopifyConnection.exists({ status: 'connected' })) throw fail('Connect Shopify before retrying.', 409);
+  const resource = task.type === 'product-update' ? 'productId' : task.type === 'barcode-update' ? 'variantId' : null;
+  if (resource && await ShopifyTask.exists({ type: task.type, [`payload.${resource}`]: task.payload[resource], createdAt: { $gt: task.createdAt } })) {
+    throw fail('A newer edit exists. Save the latest product details instead of replaying this older edit.', 409);
+  }
+  if (['catalog-sync', 'order-reconcile', 'webhook-register'].includes(task.type) && await ShopifyTask.exists({ _id: { $ne: task._id }, type: task.type, status: { $in: ['pending', 'processing'] } })) {
+    throw fail('This type of sync is already queued or running.', 409);
+  }
+  const retried = await ShopifyTask.findOneAndUpdate({ _id: task._id, status: task.status, updatedAt: task.updatedAt }, { $set: {
+    status: 'pending', cancelRequested: false, leaseToken: null, leaseUntil: null,
+    availableAt: new Date(), startedAt: null, finishedAt: null, lastError: '', result: null,
+  } }, { new: true });
+  if (!retried) throw fail('Task state changed. Refresh and try again.', 409);
+  if (task.type === 'catalog-sync') await ShopifyConnection.updateOne({}, { $set: {
+    catalogSync: { status: 'running', startedAt: new Date(), finishedAt: null, productsWritten: 0, variantsWritten: 0, pages: 0, stage: 'Queued for background processing…', error: '' },
+  } });
+  res.status(202).json({ success: true, data: { task: publicTask(retried) } });
+};
+
+export const cancelShopifyTask = async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.taskId)) throw fail('Invalid task ID.');
+  const task = await ShopifyTask.findOneAndUpdate({ _id: req.params.taskId, status: { $in: ['pending', 'failed'] } }, { $set: {
+    status: 'cancelled', finishedAt: new Date(), leaseUntil: null, leaseToken: null, cancelRequested: false,
+  } }, { new: true });
+  if (task) {
+    if (task.type === 'catalog-sync') await ShopifyConnection.updateOne({}, { $set: {
+      'catalogSync.status': 'cancelled', 'catalogSync.finishedAt': new Date(), 'catalogSync.stage': 'Catalog sync cancelled', 'catalogSync.error': '',
+    } });
+    return res.json({ success: true, data: { task: publicTask(task) } });
+  }
+  const running = await ShopifyTask.findOneAndUpdate({ _id: req.params.taskId, status: 'processing' }, { $set: { cancelRequested: true } }, { new: true });
+  if (!running) throw fail('Task has already finished or was cancelled.', 409);
+  res.status(202).json({ success: true, data: { task: publicTask(running) } });
 };
 
 export const reconcileShopifyOrders = async (req, res) => {
@@ -320,7 +366,7 @@ export const editRetailProduct = async (req, res) => {
   if (new Set(skus).size !== skus.length || new Set(barcodes).size !== barcodes.length) throw fail('Each SKU and barcode must be unique within this product.');
   const existingVariants = await RetailVariant.find({ product: product._id }).select('_id').lean();
   const existingIds = new Set(existingVariants.map((variant) => String(variant._id)));
-  if (variants.length !== existingIds.size || variants.some((variant) => !existingIds.has(variant.id))) throw fail('The product variants changed. Refresh the page before editing.', 409);
+  if (new Set(variants.map((variant) => variant.id)).size !== variants.length || variants.length !== existingIds.size || variants.some((variant) => !existingIds.has(variant.id))) throw fail('The product variants changed. Refresh the page before editing.', 409);
   const editedIds = variants.map((variant) => variant.id);
   if (skus.length && await RetailVariant.exists({ sku: { $in: skus }, _id: { $nin: editedIds } })) throw fail('A SKU is already used by another catalog variant.', 409);
   if (barcodes.length && await RetailVariant.exists({ barcode: { $in: barcodes }, _id: { $nin: editedIds } })) throw fail('A barcode is already used by another catalog variant.', 409);
@@ -329,12 +375,12 @@ export const editRetailProduct = async (req, res) => {
   if (product.shopifyProductId) {
     const connection = await ShopifyConnection.findOne({ status: 'connected' }).lean();
     if (!connection) throw fail('Connect Shopify before editing this Shopify-linked product.', 409);
-    const task = await enqueueShopifyTask('product-update', { productId: String(product._id), productInput, variants });
     product.set({ ...productInput, isActive: status === 'active' });
     await product.save();
     await Promise.all(variants.map((variant) => RetailVariant.updateOne({ _id: variant.id, product: product._id }, {
       $set: { title: variant.title, sku: variant.sku, barcode: variant.barcode, price: variant.price, compareAtPrice: variant.compareAtPrice, unitCost: variant.unitCost, unitCostSource: 'manual', unitCostStatus: variant.unitCost == null ? 'review' : 'complete', inventoryPolicy: variant.inventoryPolicy, tracked: variant.tracked, isActive: status === 'active', barcodeSyncStatus: 'pending', barcodeSyncError: '' },
     })));
+    const task = await enqueueShopifyTask('product-update', { productId: String(product._id), productInput, variants });
     return res.status(202).json({ success: true, data: { productId: product._id, status, task: publicTask(task), message: 'Saved locally. Shopify is updating in the background.' } });
   }
 
@@ -354,11 +400,11 @@ export const editRetailBarcode = async (req, res) => {
   const connectedShopify = variant.shopifyVariantId && await ShopifyConnection.exists({ status: 'connected' });
   const result = connectedShopify
     ? await (async () => {
-      const task = await enqueueShopifyTask('barcode-update', { variantId: String(variant._id), barcode });
       variant.barcode = barcode;
       variant.barcodeSyncStatus = 'pending';
       variant.barcodeSyncError = '';
       await variant.save();
+      const task = await enqueueShopifyTask('barcode-update', { variantId: String(variant._id), barcode });
       return { _id: variant._id, barcode, barcodeSyncStatus: 'pending', task: publicTask(task) };
     })()
     : await (async () => {

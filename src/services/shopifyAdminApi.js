@@ -1,3 +1,4 @@
+import { checkShopifyTask } from './shopifyTaskContext.js';
 import crypto from 'crypto';
 import mongoose from 'mongoose';
 import { env } from '../config/env.js';
@@ -18,7 +19,8 @@ const connectionWithSecrets = async () => ShopifyConnection.findOne({ status: { 
 const accessTokenCache = new Map();
 
 const exchangeClientCredentials = async ({ shopDomain, clientId, clientSecret }) => {
-  const key = `${shopDomain}:${clientId}`;
+  const credentialHash = crypto.createHash('sha256').update(clientSecret).digest('hex');
+  const key = `${shopDomain}:${clientId}:${credentialHash}`;
   const cached = accessTokenCache.get(key);
   if (cached && cached.expiresAt > Date.now() + 60_000) return cached.accessToken;
 
@@ -55,7 +57,9 @@ export const getShopifyConnectionSecrets = async () => {
 };
 
 export const shopifyGraphql = async (query, variables = {}) => {
+  await checkShopifyTask();
   const { connection, accessToken } = await getShopifyConnectionSecrets();
+  await checkShopifyTask();
   const apiVersion = /^\d{4}-\d{2}$/.test(connection.apiVersion || '')
     ? connection.apiVersion
     : env.SHOPIFY_API_VERSION;
@@ -328,6 +332,7 @@ export const importShopifyCatalog = async ({ maxPages = 100, onProgress = null, 
     if (typeof onProgress === 'function') await onProgress({ productsWritten, variantsWritten, pages, stage });
   };
   const throwIfCancelled = async () => {
+    await checkShopifyTask();
     if (typeof shouldCancel === 'function' && await shouldCancel()) {
       throw Object.assign(new Error('Shopify catalog sync cancelled.'), { code: 'SHOPIFY_TASK_CANCELLED' });
     }
@@ -419,7 +424,8 @@ export const updateShopifyVariantBarcode = async (variantId, barcode) => {
     });
     const payload = data?.productVariantsBulkUpdate;
     if (payload?.userErrors?.length) throw new Error(payload.userErrors.map((e) => e.message).join('; '));
-    const savedBarcode = payload?.productVariants?.[0]?.barcode || '';
+    if (!payload?.productVariants?.[0]?.id) throw new Error('Shopify did not confirm the barcode update.');
+    const savedBarcode = payload.productVariants[0].barcode || '';
     await RetailVariant.updateOne({ _id: variant._id }, {
       $set: { barcode: savedBarcode, barcodeSyncStatus: 'synced', barcodeSyncError: '' },
     });
